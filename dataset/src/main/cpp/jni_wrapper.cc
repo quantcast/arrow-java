@@ -15,20 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <mutex>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 
 #include "arrow/array.h"
 #include "arrow/array/concatenate.h"
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
-#include "arrow/compute/initialize.h"
 #include "arrow/dataset/api.h"
 #include "arrow/dataset/file_base.h"
 #ifdef ARROW_CSV
 #include "arrow/dataset/file_csv.h"
 #endif
+#include "arrow/dataset/file_parquet.h"
+#include "parquet/properties.h"
 #include "arrow/filesystem/api.h"
 #include "arrow/filesystem/path_util.h"
 #include "arrow/engine/substrait/util.h"
@@ -36,6 +41,7 @@
 #include "arrow/engine/substrait/relation.h"
 #include "arrow/ipc/api.h"
 #include "arrow/util/iterator.h"
+#include "arrow/util/thread_pool.h"
 #include "jni_util.h"
 #include "org_apache_arrow_dataset_file_JniWrapper.h"
 #include "org_apache_arrow_dataset_jni_JniWrapper.h"
@@ -54,6 +60,10 @@ jmethodID reserve_memory_method;
 jmethodID unreserve_memory_method;
 
 jlong default_memory_pool_id = -1L;
+
+// Set by the atexit handler to signal that the JVM is shutting down.
+// JNI_OnUnload checks this before touching the thread pool.
+std::atomic<bool> jvm_shutting_down{false};
 
 jint JNI_VERSION = JNI_VERSION_10;
 
@@ -298,11 +308,36 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
       GetMethodID(env, java_reservation_listener_class, "unreserve", "(J)V"));
 
   default_memory_pool_id = reinterpret_cast<jlong>(arrow::default_memory_pool());
+
+  // Force-initialize Arrow's CPU thread pool singleton, then register an atexit
+  // handler that pre-shuts it down.  This prevents a deadlock during exit():
+  //
+  //   exit() → __cxa_finalize_ranges → ThreadPool::~ThreadPool()
+  //          → Shutdown(wait=true) → condition_variable::wait()  ← deadlock
+  //
+  // The pool's destructor is registered (implicitly) with atexit at first
+  // construction.  By initializing it here and registering our handler afterwards,
+  // LIFO ordering guarantees our handler runs *before* the destructor.  Our handler
+  // calls Shutdown(false), which sets please_shutdown_=true.  The destructor then
+  // sees that flag and returns immediately (DCHECK_OK is a no-op in release builds).
+  arrow::internal::GetCpuThreadPool();
+  std::atexit([]() {
+    jvm_shutting_down.store(true, std::memory_order_release);
+    ARROW_UNUSED(arrow::internal::GetCpuThreadPool()->Shutdown(false));
+  });
+
   return JNI_VERSION;
   JNI_METHOD_END(JNI_ERR)
 }
 
 void JNI_OnUnload(JavaVM* vm, void* reserved) {
+  // Only shut down the thread pool if the JVM is exiting (atexit already fired or
+  // will fire).  If JNI_OnUnload is called for some other reason (e.g. classloader
+  // GC while the application is still running), leave the pool alive.
+  if (jvm_shutting_down.load(std::memory_order_acquire)) {
+    ARROW_UNUSED(arrow::internal::GetCpuThreadPool()->Shutdown(false));
+  }
+
   JNIEnv* env;
   vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION);
   env->DeleteGlobalRef(illegal_access_exception_class);
@@ -808,13 +843,6 @@ JNIEXPORT void JNICALL Java_org_apache_arrow_dataset_jni_JniWrapper_ensureS3Fina
   JNI_METHOD_END()
 }
 
-JNIEXPORT void JNICALL Java_org_apache_arrow_dataset_jni_JniWrapper_initialize(
-    JNIEnv* env, jobject) {
-  JNI_METHOD_START
-  JniAssertOkOrThrow(arrow::compute::Initialize());
-  JNI_METHOD_END()
-}
-
 /*
  * Class:     org_apache_arrow_dataset_file_JniWrapper
  * Method:    makeFileSystemDatasetFactory
@@ -908,18 +936,10 @@ Java_org_apache_arrow_dataset_file_JniWrapper_makeFileSystemDatasetFactoryWithFi
   JNI_METHOD_END(-1L)
 }
 
-/*
- * Class:     org_apache_arrow_dataset_file_JniWrapper
- * Method:    writeFromScannerToFile
- * Signature:
- * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;)V
- */
-JNIEXPORT void JNICALL
-Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
-    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
-    jlong file_format_id, jstring uri, jobjectArray partition_columns,
-    jint max_partitions, jstring base_name_template) {
-  JNI_METHOD_START
+void WriteToFile(JNIEnv* env, jlong c_arrow_array_stream_address,
+                 jlong file_format_id, jstring uri,
+                 jobjectArray partition_columns, jint max_partitions,
+                 jstring base_name_template, jobjectArray writer_options) {
   JavaVM* vm;
   if (env->GetJavaVM(&vm) != JNI_OK) {
     JniThrow("Unable to get JavaVM instance");
@@ -948,9 +968,129 @@ Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
   options.base_dir = output_path;
   options.basename_template = JStringToCString(env, base_name_template);
   options.partitioning = std::make_shared<arrow::dataset::HivePartitioning>(
-      SchemaFromColumnNames(schema, partition_column_vector).ValueOrDie());
+      JniGetOrThrow(SchemaFromColumnNames(schema, partition_column_vector)));
   options.max_partitions = max_partitions;
+
+  if (writer_options != nullptr) {
+    auto option_map = ToStringMap(env, writer_options);
+
+    // Handle existing_data_behavior (applies to all formats, not just Parquet)
+    auto edb_it = option_map.find("existing_data_behavior");
+    if (edb_it != option_map.end()) {
+      std::string v = edb_it->second;
+      std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+      });
+      if (v == "DELETE_MATCHING" || v == "DELETE_MATCHING_PARTITIONS") {
+        options.existing_data_behavior =
+            arrow::dataset::ExistingDataBehavior::kDeleteMatchingPartitions;
+      } else if (v == "OVERWRITE_OR_IGNORE" || v == "OVERWRITE") {
+        options.existing_data_behavior =
+            arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
+      } else if (v == "ERROR") {
+        options.existing_data_behavior =
+            arrow::dataset::ExistingDataBehavior::kError;
+      } else {
+        JniThrow("Unsupported existing_data_behavior: " + edb_it->second);
+        return;
+      }
+      option_map.erase(edb_it);
+    }
+
+    auto* pq_options =
+        dynamic_cast<arrow::dataset::ParquetFileWriteOptions*>(
+            options.file_write_options.get());
+    if (pq_options != nullptr) {
+      parquet::WriterProperties::Builder builder;
+      auto it = option_map.find("compression");
+      if (it != option_map.end()) {
+        std::string v = it->second;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+          return static_cast<char>(std::toupper(c));
+        });
+        parquet::Compression::type codec;
+        if (v == "UNCOMPRESSED" || v == "NONE") {
+          codec = parquet::Compression::UNCOMPRESSED;
+        } else if (v == "SNAPPY") {
+          codec = parquet::Compression::SNAPPY;
+        } else if (v == "GZIP" || v == "GZ" || v == "ZLIB") {
+          codec = parquet::Compression::GZIP;
+        } else if (v == "ZSTD") {
+          codec = parquet::Compression::ZSTD;
+        } else if (v == "LZ4" || v == "LZ4_FRAME") {
+          codec = parquet::Compression::LZ4;
+        } else if (v == "BROTLI" || v == "BR") {
+          codec = parquet::Compression::BROTLI;
+        } else if (v == "LZO") {
+          codec = parquet::Compression::LZO;
+        } else {
+          JniThrow("Unsupported compression codec: " + it->second);
+          return;
+        }
+        builder.compression(codec);
+      }
+      it = option_map.find("data_page_size");
+      if (it != option_map.end()) {
+        try {
+          builder.data_pagesize(std::stoll(it->second));
+        } catch (const std::exception&) {
+          JniThrow("Invalid data_page_size value: " + it->second);
+          return;
+        }
+      }
+      it = option_map.find("max_row_group_length");
+      if (it != option_map.end()) {
+        try {
+          builder.max_row_group_length(std::stoll(it->second));
+        } catch (const std::exception&) {
+          JniThrow("Invalid max_row_group_length value: " + it->second);
+          return;
+        }
+      }
+      it = option_map.find("write_batch_size");
+      if (it != option_map.end()) {
+        try {
+          builder.write_batch_size(std::stoll(it->second));
+        } catch (const std::exception&) {
+          JniThrow("Invalid write_batch_size value: " + it->second);
+          return;
+        }
+      }
+      it = option_map.find("use_dictionary");
+      if (it != option_map.end()) {
+        if (it->second == "true") {
+          builder.enable_dictionary();
+        } else if (it->second == "false") {
+          builder.disable_dictionary();
+        } else {
+          JniThrow("use_dictionary must be 'true' or 'false', got: " + it->second);
+          return;
+        }
+      }
+      pq_options->writer_properties = builder.build();
+    } else if (!option_map.empty()) {
+      JniThrow("Writer options are only supported for Parquet format");
+      return;
+    }
+  }
+
   JniAssertOkOrThrow(arrow::dataset::FileSystemDataset::Write(options, scanner));
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    writeFromScannerToFile
+ * Signature:
+ * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
+    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
+    jlong file_format_id, jstring uri, jobjectArray partition_columns,
+    jint max_partitions, jstring base_name_template) {
+  JNI_METHOD_START
+  WriteToFile(env, c_arrow_array_stream_address, file_format_id, uri,
+              partition_columns, max_partitions, base_name_template, nullptr);
   JNI_METHOD_END()
 }
 
@@ -1018,4 +1158,47 @@ JNIEXPORT void JNICALL
   auto* arrow_stream_out = reinterpret_cast<ArrowArrayStream*>(memory_address_output);
   JniAssertOkOrThrow(arrow::ExportRecordBatchReader(reader_out, arrow_stream_out));
   JNI_METHOD_END()
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    writeFromScannerToFileWithOptions
+ * Signature:
+ * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;[Ljava/lang/String;)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFileWithOptions(
+    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
+    jlong file_format_id, jstring uri, jobjectArray partition_columns,
+    jint max_partitions, jstring base_name_template, jobjectArray writer_options) {
+  JNI_METHOD_START
+  WriteToFile(env, c_arrow_array_stream_address, file_format_id, uri,
+              partition_columns, max_partitions, base_name_template, writer_options);
+  JNI_METHOD_END()
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    setCpuThreadPoolCapacity
+ * Signature: (I)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_setCpuThreadPoolCapacity(
+    JNIEnv* env, jobject, jint num_threads) {
+  JNI_METHOD_START
+  JniAssertOkOrThrow(arrow::SetCpuThreadPoolCapacity(num_threads));
+  JNI_METHOD_END()
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    getCpuThreadPoolCapacity
+ * Signature: ()I
+ */
+JNIEXPORT jint JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_getCpuThreadPoolCapacity(
+    JNIEnv* env, jobject) {
+  JNI_METHOD_START
+  return arrow::GetCpuThreadPoolCapacity();
+  JNI_METHOD_END(-1)
 }

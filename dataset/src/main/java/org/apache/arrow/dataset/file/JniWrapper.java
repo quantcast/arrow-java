@@ -77,4 +77,33 @@ public class JniWrapper {
       String[] partitionColumns,
       int maxPartitions,
       String baseNameTemplate);
+
+  /**
+   * Write the content in a {@link org.apache.arrow.c.ArrowArrayStream} into files with configurable
+   * writer options. Options are passed as alternating key/value strings. Currently only Parquet
+   * options are recognized; unsupported keys are ignored. Supported keys (Parquet): - compression:
+   * one of UNCOMPRESSED,SNAPPY,GZIP,ZSTD,LZ4,BROTLI (case-insensitive)
+   */
+  public native void writeFromScannerToFileWithOptions(
+      long streamAddress,
+      long fileFormat,
+      String uri,
+      String[] partitionColumns,
+      int maxPartitions,
+      String baseNameTemplate,
+      String[] writerOptions);
+
+  /**
+   * Set the capacity (number of worker threads) of Arrow's global CPU thread pool.
+   * This affects all Arrow operations that use the pool (e.g. dataset writes).
+   * Must be called before any writes; the default is {@code Runtime.availableProcessors()}.
+   *
+   * @param numThreads desired number of worker threads (must be &gt; 0)
+   */
+  public native void setCpuThreadPoolCapacity(int numThreads);
+
+  /**
+   * Return the current capacity of Arrow's global CPU thread pool.
+   */
+  public native int getCpuThreadPoolCapacity();
 }

@@ -56,7 +56,6 @@ public final class JniLoader {
     }
     loadRemaining();
     ensureS3FinalizedOnShutdown();
-    JniWrapper.get().initialize();
   }
 
   private synchronized void loadRemaining() {
