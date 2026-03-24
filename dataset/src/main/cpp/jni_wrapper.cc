@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 
 #include "arrow/array.h"
 #include "arrow/array/concatenate.h"
@@ -29,6 +31,8 @@
 #ifdef ARROW_CSV
 #include "arrow/dataset/file_csv.h"
 #endif
+#include "arrow/dataset/file_parquet.h"
+#include "parquet/properties.h"
 #include "arrow/filesystem/api.h"
 #include "arrow/filesystem/path_util.h"
 #include "arrow/engine/substrait/util.h"
@@ -908,18 +912,10 @@ Java_org_apache_arrow_dataset_file_JniWrapper_makeFileSystemDatasetFactoryWithFi
   JNI_METHOD_END(-1L)
 }
 
-/*
- * Class:     org_apache_arrow_dataset_file_JniWrapper
- * Method:    writeFromScannerToFile
- * Signature:
- * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;)V
- */
-JNIEXPORT void JNICALL
-Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
-    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
-    jlong file_format_id, jstring uri, jobjectArray partition_columns,
-    jint max_partitions, jstring base_name_template) {
-  JNI_METHOD_START
+void WriteToFile(JNIEnv* env, jlong c_arrow_array_stream_address,
+                 jlong file_format_id, jstring uri,
+                 jobjectArray partition_columns, jint max_partitions,
+                 jstring base_name_template, jobjectArray writer_options) {
   JavaVM* vm;
   if (env->GetJavaVM(&vm) != JNI_OK) {
     JniThrow("Unable to get JavaVM instance");
@@ -948,9 +944,67 @@ Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
   options.base_dir = output_path;
   options.basename_template = JStringToCString(env, base_name_template);
   options.partitioning = std::make_shared<arrow::dataset::HivePartitioning>(
-      SchemaFromColumnNames(schema, partition_column_vector).ValueOrDie());
+      JniGetOrThrow(SchemaFromColumnNames(schema, partition_column_vector)));
   options.max_partitions = max_partitions;
+
+  if (writer_options != nullptr) {
+    auto option_map = ToStringMap(env, writer_options);
+    auto* pq_options =
+        dynamic_cast<arrow::dataset::ParquetFileWriteOptions*>(
+            options.file_write_options.get());
+    if (pq_options != nullptr) {
+      parquet::WriterProperties::Builder builder;
+      auto it = option_map.find("compression");
+      if (it != option_map.end()) {
+        std::string v = it->second;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+          return static_cast<char>(std::toupper(c));
+        });
+        parquet::Compression::type codec;
+        if (v == "UNCOMPRESSED" || v == "NONE") {
+          codec = parquet::Compression::UNCOMPRESSED;
+        } else if (v == "SNAPPY") {
+          codec = parquet::Compression::SNAPPY;
+        } else if (v == "GZIP" || v == "GZ" || v == "ZLIB") {
+          codec = parquet::Compression::GZIP;
+        } else if (v == "ZSTD") {
+          codec = parquet::Compression::ZSTD;
+        } else if (v == "LZ4" || v == "LZ4_FRAME") {
+          codec = parquet::Compression::LZ4;
+        } else if (v == "BROTLI" || v == "BR") {
+          codec = parquet::Compression::BROTLI;
+        } else if (v == "LZO") {
+          codec = parquet::Compression::LZO;
+        } else {
+          JniThrow("Unsupported compression codec: " + it->second);
+          return;
+        }
+        builder.compression(codec);
+      }
+      pq_options->writer_properties = builder.build();
+    } else if (!option_map.empty()) {
+      JniThrow("Writer options are only supported for Parquet format");
+      return;
+    }
+  }
+
   JniAssertOkOrThrow(arrow::dataset::FileSystemDataset::Write(options, scanner));
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    writeFromScannerToFile
+ * Signature:
+ * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFile(
+    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
+    jlong file_format_id, jstring uri, jobjectArray partition_columns,
+    jint max_partitions, jstring base_name_template) {
+  JNI_METHOD_START
+  WriteToFile(env, c_arrow_array_stream_address, file_format_id, uri,
+              partition_columns, max_partitions, base_name_template, nullptr);
   JNI_METHOD_END()
 }
 
@@ -1017,5 +1071,22 @@ JNIEXPORT void JNICALL
     JniGetOrThrow(arrow::engine::ExecuteSerializedPlan(*buffer, nullptr, nullptr, conversion_options));
   auto* arrow_stream_out = reinterpret_cast<ArrowArrayStream*>(memory_address_output);
   JniAssertOkOrThrow(arrow::ExportRecordBatchReader(reader_out, arrow_stream_out));
+  JNI_METHOD_END()
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    writeFromScannerToFileWithOptions
+ * Signature:
+ * (JJJLjava/lang/String;[Ljava/lang/String;ILjava/lang/String;[Ljava/lang/String;)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_writeFromScannerToFileWithOptions(
+    JNIEnv* env, jobject, jlong c_arrow_array_stream_address,
+    jlong file_format_id, jstring uri, jobjectArray partition_columns,
+    jint max_partitions, jstring base_name_template, jobjectArray writer_options) {
+  JNI_METHOD_START
+  WriteToFile(env, c_arrow_array_stream_address, file_format_id, uri,
+              partition_columns, max_partitions, base_name_template, writer_options);
   JNI_METHOD_END()
 }

@@ -77,4 +77,19 @@ public class JniWrapper {
       String[] partitionColumns,
       int maxPartitions,
       String baseNameTemplate);
+
+  /**
+   * Write the content in a {@link org.apache.arrow.c.ArrowArrayStream} into files with configurable
+   * writer options. Options are passed as alternating key/value strings. Currently only Parquet
+   * options are recognized; unsupported keys are ignored. Supported keys (Parquet): - compression:
+   * one of UNCOMPRESSED,SNAPPY,GZIP,ZSTD,LZ4,BROTLI (case-insensitive)
+   */
+  public native void writeFromScannerToFileWithOptions(
+      long streamAddress,
+      long fileFormat,
+      String uri,
+      String[] partitionColumns,
+      int maxPartitions,
+      String baseNameTemplate,
+      String[] writerOptions);
 }
