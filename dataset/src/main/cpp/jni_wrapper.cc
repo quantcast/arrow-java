@@ -33,6 +33,7 @@
 #include "arrow/dataset/file_csv.h"
 #endif
 #include "arrow/dataset/file_parquet.h"
+#include "parquet/arrow/writer.h"
 #include "parquet/properties.h"
 #include "arrow/filesystem/api.h"
 #include "arrow/filesystem/path_util.h"
@@ -521,6 +522,83 @@ GetFragmentScanOptions(jint file_format_id,
   }
 }
 
+// Apply Parquet-specific writer options from a key/value map onto the given Builder.
+// Throws via JniThrow if any value fails to parse. Keys not listed here are ignored so
+// callers can mix them with non-Parquet keys.
+void ApplyParquetWriterOptions(
+    const std::unordered_map<std::string, std::string>& option_map,
+    parquet::WriterProperties::Builder* builder) {
+  auto it = option_map.find("compression");
+  if (it != option_map.end()) {
+    std::string v = it->second;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+      return static_cast<char>(std::toupper(c));
+    });
+    parquet::Compression::type codec;
+    if (v == "UNCOMPRESSED" || v == "NONE") {
+      codec = parquet::Compression::UNCOMPRESSED;
+    } else if (v == "SNAPPY") {
+      codec = parquet::Compression::SNAPPY;
+    } else if (v == "GZIP" || v == "GZ" || v == "ZLIB") {
+      codec = parquet::Compression::GZIP;
+    } else if (v == "ZSTD") {
+      codec = parquet::Compression::ZSTD;
+    } else if (v == "LZ4" || v == "LZ4_FRAME") {
+      codec = parquet::Compression::LZ4;
+    } else if (v == "BROTLI" || v == "BR") {
+      codec = parquet::Compression::BROTLI;
+    } else if (v == "LZO") {
+      codec = parquet::Compression::LZO;
+    } else {
+      JniThrow("Unsupported compression codec: " + it->second);
+    }
+    builder->compression(codec);
+  }
+  it = option_map.find("data_page_size");
+  if (it != option_map.end()) {
+    try {
+      builder->data_pagesize(std::stoll(it->second));
+    } catch (const std::exception&) {
+      JniThrow("Invalid data_page_size value: " + it->second);
+    }
+  }
+  it = option_map.find("max_row_group_length");
+  if (it != option_map.end()) {
+    try {
+      builder->max_row_group_length(std::stoll(it->second));
+    } catch (const std::exception&) {
+      JniThrow("Invalid max_row_group_length value: " + it->second);
+    }
+  }
+  it = option_map.find("write_batch_size");
+  if (it != option_map.end()) {
+    try {
+      builder->write_batch_size(std::stoll(it->second));
+    } catch (const std::exception&) {
+      JniThrow("Invalid write_batch_size value: " + it->second);
+    }
+  }
+  it = option_map.find("use_dictionary");
+  if (it != option_map.end()) {
+    if (it->second == "true") {
+      builder->enable_dictionary();
+    } else if (it->second == "false") {
+      builder->disable_dictionary();
+    } else {
+      JniThrow("use_dictionary must be 'true' or 'false', got: " + it->second);
+    }
+  }
+}
+
+// Holder for a streaming parquet::arrow::FileWriter plus its output stream. The object
+// returned via a jlong handle from openParquetStreamWriter and freed in
+// closeParquetStreamWriter.
+struct ParquetStreamWriterHolder {
+  std::shared_ptr<arrow::io::OutputStream> output_stream;
+  std::shared_ptr<arrow::Schema> schema;
+  std::unique_ptr<parquet::arrow::FileWriter> writer;
+};
+
 std::unordered_map<std::string, std::string> ToStringMap(JNIEnv* env,
                                                          jobjectArray& str_array) {
   int length = env->GetArrayLength(str_array);
@@ -1002,71 +1080,7 @@ void WriteToFile(JNIEnv* env, jlong c_arrow_array_stream_address,
             options.file_write_options.get());
     if (pq_options != nullptr) {
       parquet::WriterProperties::Builder builder;
-      auto it = option_map.find("compression");
-      if (it != option_map.end()) {
-        std::string v = it->second;
-        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
-          return static_cast<char>(std::toupper(c));
-        });
-        parquet::Compression::type codec;
-        if (v == "UNCOMPRESSED" || v == "NONE") {
-          codec = parquet::Compression::UNCOMPRESSED;
-        } else if (v == "SNAPPY") {
-          codec = parquet::Compression::SNAPPY;
-        } else if (v == "GZIP" || v == "GZ" || v == "ZLIB") {
-          codec = parquet::Compression::GZIP;
-        } else if (v == "ZSTD") {
-          codec = parquet::Compression::ZSTD;
-        } else if (v == "LZ4" || v == "LZ4_FRAME") {
-          codec = parquet::Compression::LZ4;
-        } else if (v == "BROTLI" || v == "BR") {
-          codec = parquet::Compression::BROTLI;
-        } else if (v == "LZO") {
-          codec = parquet::Compression::LZO;
-        } else {
-          JniThrow("Unsupported compression codec: " + it->second);
-          return;
-        }
-        builder.compression(codec);
-      }
-      it = option_map.find("data_page_size");
-      if (it != option_map.end()) {
-        try {
-          builder.data_pagesize(std::stoll(it->second));
-        } catch (const std::exception&) {
-          JniThrow("Invalid data_page_size value: " + it->second);
-          return;
-        }
-      }
-      it = option_map.find("max_row_group_length");
-      if (it != option_map.end()) {
-        try {
-          builder.max_row_group_length(std::stoll(it->second));
-        } catch (const std::exception&) {
-          JniThrow("Invalid max_row_group_length value: " + it->second);
-          return;
-        }
-      }
-      it = option_map.find("write_batch_size");
-      if (it != option_map.end()) {
-        try {
-          builder.write_batch_size(std::stoll(it->second));
-        } catch (const std::exception&) {
-          JniThrow("Invalid write_batch_size value: " + it->second);
-          return;
-        }
-      }
-      it = option_map.find("use_dictionary");
-      if (it != option_map.end()) {
-        if (it->second == "true") {
-          builder.enable_dictionary();
-        } else if (it->second == "false") {
-          builder.disable_dictionary();
-        } else {
-          JniThrow("use_dictionary must be 'true' or 'false', got: " + it->second);
-          return;
-        }
-      }
+      ApplyParquetWriterOptions(option_map, &builder);
       pq_options->writer_properties = builder.build();
     } else if (!option_map.empty()) {
       JniThrow("Writer options are only supported for Parquet format");
@@ -1201,4 +1215,93 @@ Java_org_apache_arrow_dataset_file_JniWrapper_getCpuThreadPoolCapacity(
   JNI_METHOD_START
   return arrow::GetCpuThreadPoolCapacity();
   JNI_METHOD_END(-1)
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    openParquetStreamWriter
+ * Signature: (JLjava/lang/String;[Ljava/lang/String;)J
+ */
+JNIEXPORT jlong JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_openParquetStreamWriter(
+    JNIEnv* env, jobject, jlong schema_address, jstring uri,
+    jobjectArray writer_options) {
+  JNI_METHOD_START
+  auto* c_schema = reinterpret_cast<ArrowSchema*>(schema_address);
+  std::shared_ptr<arrow::Schema> schema = JniGetOrThrow(arrow::ImportSchema(c_schema));
+
+  // Open filesystem + output stream from the URI.
+  std::string output_path;
+  auto filesystem = JniGetOrThrow(
+      arrow::fs::FileSystemFromUri(JStringToCString(env, uri), &output_path));
+  auto out_stream = JniGetOrThrow(filesystem->OpenOutputStream(output_path));
+
+  // Build writer properties from the option map (Parquet-specific options only).
+  parquet::WriterProperties::Builder props_builder;
+  if (writer_options != nullptr) {
+    auto option_map = ToStringMap(env, writer_options);
+    ApplyParquetWriterOptions(option_map, &props_builder);
+  }
+  auto writer_props = props_builder.build();
+
+  // Arrow-side writer properties. Disable column-parallel writes so multiple concurrent
+  // ParquetFileStreamWriter instances don't deadlock the shared CPU thread pool, as
+  // documented on parquet::arrow::FileWriter::WriteRecordBatch.
+  auto arrow_props = parquet::ArrowWriterProperties::Builder().set_use_threads(false)->build();
+
+  auto writer = JniGetOrThrow(parquet::arrow::FileWriter::Open(
+      *schema, arrow::default_memory_pool(), out_stream, writer_props, arrow_props));
+
+  // Start the single buffered row group; WriteRecordBatch appends into it until
+  // max_row_group_length rolls over (at which point a new row group starts, but for our
+  // log-file sizing the cap is set very high so this rarely happens).
+  JniAssertOkOrThrow(writer->NewBufferedRowGroup());
+
+  auto* holder = new ParquetStreamWriterHolder();
+  holder->output_stream = std::move(out_stream);
+  holder->schema = std::move(schema);
+  holder->writer = std::move(writer);
+  return reinterpret_cast<jlong>(holder);
+  JNI_METHOD_END(0L)
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    writeBatchToParquetStream
+ * Signature: (JJJ)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_writeBatchToParquetStream(
+    JNIEnv* env, jobject, jlong native_handle, jlong array_address,
+    jlong schema_address) {
+  JNI_METHOD_START
+  if (native_handle == 0) {
+    JniThrow("writeBatchToParquetStream called with null handle");
+  }
+  auto* holder = reinterpret_cast<ParquetStreamWriterHolder*>(native_handle);
+  auto* c_array = reinterpret_cast<ArrowArray*>(array_address);
+  auto* c_schema = reinterpret_cast<ArrowSchema*>(schema_address);
+  auto batch = JniGetOrThrow(arrow::ImportRecordBatch(c_array, c_schema));
+  JniAssertOkOrThrow(holder->writer->WriteRecordBatch(*batch));
+  JNI_METHOD_END()
+}
+
+/*
+ * Class:     org_apache_arrow_dataset_file_JniWrapper
+ * Method:    closeParquetStreamWriter
+ * Signature: (J)V
+ */
+JNIEXPORT void JNICALL
+Java_org_apache_arrow_dataset_file_JniWrapper_closeParquetStreamWriter(
+    JNIEnv* env, jobject, jlong native_handle) {
+  JNI_METHOD_START
+  if (native_handle == 0) {
+    return;
+  }
+  std::unique_ptr<ParquetStreamWriterHolder> holder(
+      reinterpret_cast<ParquetStreamWriterHolder*>(native_handle));
+  JniAssertOkOrThrow(holder->writer->Close());
+  JniAssertOkOrThrow(holder->output_stream->Close());
+  // holder destructor releases remaining shared_ptrs.
+  JNI_METHOD_END()
 }

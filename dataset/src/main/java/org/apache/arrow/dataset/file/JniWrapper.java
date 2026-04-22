@@ -106,4 +106,39 @@ public class JniWrapper {
    * Return the current capacity of Arrow's global CPU thread pool.
    */
   public native int getCpuThreadPoolCapacity();
+
+  /**
+   * Open a {@code parquet::arrow::FileWriter} on the given URI using the provided schema, and
+   * start a single buffered row group via {@code NewBufferedRowGroup}. All subsequent batches
+   * written via {@link #writeBatchToParquetStream} accumulate into this row group until
+   * {@code max_row_group_length} is exceeded (which would implicitly start a new row group).
+   *
+   * <p>The {@code ArrowSchema} struct at {@code schemaAddress} is consumed (released) by this
+   * call, per the C data interface contract.
+   *
+   * @param schemaAddress address of an exported {@code ArrowSchema} C struct
+   * @param uri target file URI
+   * @param writerOptions alternating key/value strings, same keys as {@code
+   *     writeFromScannerToFileWithOptions}
+   * @return an opaque native handle to be passed to {@link #writeBatchToParquetStream} and
+   *     {@link #closeParquetStreamWriter}. Never zero on success.
+   */
+  public native long openParquetStreamWriter(
+      long schemaAddress, String uri, String[] writerOptions);
+
+  /**
+   * Write a single {@code RecordBatch} (represented as a {@code VectorSchemaRoot} exported
+   * via the C data interface) into the buffered row group of the writer referenced by
+   * {@code nativeHandle}. Both the {@code ArrowArray} and {@code ArrowSchema} structs are
+   * consumed by this call.
+   */
+  public native void writeBatchToParquetStream(
+      long nativeHandle, long arrayAddress, long schemaAddress);
+
+  /**
+   * Finalize the Parquet file referenced by {@code nativeHandle} (writes the footer,
+   * closes the output stream, and frees all native resources). The handle is invalid after
+   * this call.
+   */
+  public native void closeParquetStreamWriter(long nativeHandle);
 }
