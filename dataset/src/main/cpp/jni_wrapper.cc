@@ -554,6 +554,14 @@ void ApplyParquetWriterOptions(
     }
     builder->compression(codec);
   }
+  it = option_map.find("compression_level");
+  if (it != option_map.end()) {
+    try {
+      builder->compression_level(std::stoi(it->second));
+    } catch (const std::exception&) {
+      JniThrow("Invalid compression_level value: " + it->second);
+    }
+  }
   it = option_map.find("data_page_size");
   if (it != option_map.end()) {
     try {

@@ -59,9 +59,9 @@ public class ParquetFileStreamWriter implements AutoCloseable {
    *     are used.
    * @param uri target file URI (e.g. {@code file:///var/log/bid-event/foo.parquet})
    * @param writerOptions Parquet writer options, same keys accepted as {@link
-   *     DatasetFileWriter}: {@code compression}, {@code data_page_size}, {@code
-   *     max_row_group_length}, {@code write_batch_size}, {@code use_dictionary}. May be null
-   *     or empty to use defaults.
+   *     DatasetFileWriter}: {@code compression}, {@code compression_level}, {@code
+   *     data_page_size}, {@code max_row_group_length}, {@code write_batch_size}, {@code
+   *     use_dictionary}. May be null or empty to use defaults.
    */
   public ParquetFileStreamWriter(
       BufferAllocator allocator,
