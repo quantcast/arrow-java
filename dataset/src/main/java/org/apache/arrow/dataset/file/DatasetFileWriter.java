@@ -75,9 +75,10 @@ public class DatasetFileWriter {
    *     formats: "existing_data_behavior" (one of DELETE_MATCHING, OVERWRITE_OR_IGNORE, ERROR,
    *     case-insensitive; controls behavior when the output directory already contains data). For
    *     Parquet, additional supported keys: "compression" (one of UNCOMPRESSED, SNAPPY, GZIP, ZSTD,
-   *     LZ4, BROTLI, case-insensitive), "data_page_size" (bytes, integer), "max_row_group_length"
-   *     (rows, integer), "write_batch_size" (rows per Arrow batch, integer), "use_dictionary"
-   *     ("true" or "false"). May be null or empty to use defaults.
+   *     LZ4, BROTLI, case-insensitive), "compression_level" (integer, codec-specific; applied to
+   *     every column, defaults to the codec's own default), "data_page_size" (bytes, integer),
+   *     "max_row_group_length" (rows, integer), "write_batch_size" (rows per Arrow batch, integer),
+   *     "use_dictionary" ("true" or "false"). May be null or empty to use defaults.
    */
   public static void write(
       BufferAllocator allocator,
